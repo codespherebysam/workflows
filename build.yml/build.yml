@@ -1,0 +1,392 @@
+name: Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      server_host:
+        description: "Your server host, e.g. my-app.onrender.com (no https://)"
+        required: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: 17 }
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: "8.7" }
+      - name: Generate project
+        env:
+          HOST: ${{ inputs.server_host }}
+        run: |
+          set -e
+          mkdir -p android && cd android
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "RemoteAssist"
+          include(":app")
+          EOF_FILE
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p .
+          cat > gradle.properties <<'EOF_FILE'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          EOF_FILE
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+            namespace = "com.example.remoteassist"
+            compileSdk = 34
+            defaultConfig { applicationId = "com.example.remoteassist"; minSdk = 29; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+            compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = "17" }
+            packaging { resources.excludes += "META-INF/*" }
+          }
+          dependencies {
+            implementation("io.getstream:stream-webrtc-android:1.1.1")
+            implementation("com.squareup.okhttp3:okhttp:4.12.0")
+            implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+            implementation("androidx.activity:activity:1.9.0")
+            implementation("androidx.core:core-ktx:1.13.1")
+          }
+          EOF_FILE
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <uses-permission android:name="android.permission.CAMERA"/>
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION"/>
+            <application android:label="Remote Assist" android:theme="@android:style/Theme.Material.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+              <service android:name=".ShareService" android:foregroundServiceType="mediaProjection" android:exported="false"/>
+              <service android:name=".ControlService" android:exported="false"
+                  android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                <meta-data android:name="android.accessibilityservice" android:resource="@xml/control_config"/>
+              </service>
+            </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p app/src/main/res/xml
+          cat > app/src/main/res/xml/control_config.xml <<'EOF_FILE'
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:canPerformGestures="true" android:accessibilityEventTypes="typeNone"
+              android:description="@string/app_name" android:accessibilityFeedbackType="feedbackGeneric"/>
+          EOF_FILE
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF_FILE'
+          <resources><string name="app_name">Remote Assist</string></resources>
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/remoteassist
+          cat > app/src/main/java/com/example/remoteassist/Net.kt <<'EOF_FILE'
+          package com.example.remoteassist
+          import android.content.Context
+          import okhttp3.*
+          import org.json.JSONObject
+
+          object Net {
+            const val SERVER = "wss://YOUR_SERVER_HOST"   // <- set to your deployed server
+            private var ws: WebSocket? = null
+            val listeners = mutableListOf<(JSONObject) -> Unit>()
+            fun connect(ctx: Context) {
+              val p = ctx.getSharedPreferences("ra", 0)
+              ws = OkHttpClient().newWebSocket(Request.Builder().url(SERVER).build(), object : WebSocketListener() {
+                override fun onOpen(w: WebSocket, r: Response) =
+                  send(JSONObject().put("t", "hello").put("id", p.getString("id", null)).put("secret", p.getString("secret", null)))
+                override fun onMessage(w: WebSocket, text: String) {
+                  val m = JSONObject(text)
+                  if (m.getString("t") == "welcome")
+                    p.edit().putString("id", m.getString("id")).putString("secret", m.getString("secret")).apply()
+                  listeners.toList().forEach { it(m) }
+                }
+              })
+            }
+            fun send(o: JSONObject) { ws?.send(o.toString()) }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/remoteassist
+          cat > app/src/main/java/com/example/remoteassist/Rtc.kt <<'EOF_FILE'
+          package com.example.remoteassist
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjection
+          import org.json.JSONObject
+          import org.webrtc.*
+          import java.nio.ByteBuffer
+
+          open class PcObs : PeerConnection.Observer {
+            override fun onSignalingChange(s: PeerConnection.SignalingState?) {}
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState?) {}
+            override fun onIceConnectionReceivingChange(b: Boolean) {}
+            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState?) {}
+            override fun onIceCandidate(c: IceCandidate?) {}
+            override fun onIceCandidatesRemoved(c: Array<out IceCandidate>?) {}
+            override fun onAddStream(s: MediaStream?) {}
+            override fun onRemoveStream(s: MediaStream?) {}
+            override fun onDataChannel(d: DataChannel?) {}
+            override fun onRenegotiationNeeded() {}
+            override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) {}
+          }
+          open class SdpObs : SdpObserver {
+            override fun onCreateSuccess(d: SessionDescription) {}
+            override fun onSetSuccess() {}
+            override fun onCreateFailure(e: String?) {}
+            override fun onSetFailure(e: String?) {}
+          }
+
+          class Rtc(ctx: Context, private val peer: String) {
+            val egl: EglBase = EglBase.create()
+            private val f: PeerConnectionFactory
+            private val pc: PeerConnection
+            private var channel: DataChannel? = null
+            var onTrack: (VideoTrack) -> Unit = {}
+            var onControl: (Float, Float) -> Unit = { _, _ -> }
+
+            init {
+              PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(ctx.applicationContext).createInitializationOptions())
+              f = PeerConnectionFactory.builder()
+                .setVideoEncoderFactory(DefaultVideoEncoderFactory(egl.eglBaseContext, true, true))
+                .setVideoDecoderFactory(DefaultVideoDecoderFactory(egl.eglBaseContext)).createPeerConnectionFactory()
+              val cfg = PeerConnection.RTCConfiguration(listOf(PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer()))
+              pc = f.createPeerConnection(cfg, object : PcObs() {
+                override fun onIceCandidate(c: IceCandidate?) {
+                  c?.let { signal(JSONObject().put("ice", JSONObject().put("m", it.sdpMid).put("i", it.sdpMLineIndex).put("s", it.sdp))) }
+                }
+                override fun onAddTrack(r: RtpReceiver?, s: Array<out MediaStream>?) { (r?.track() as? VideoTrack)?.let(onTrack) }
+                override fun onDataChannel(d: DataChannel?) { channel = d }
+              })!!
+            }
+
+            private fun signal(d: JSONObject) = Net.send(JSONObject().put("t", "signal").put("to", peer).put("data", d))
+            private fun sdp(type: String, d: SessionDescription) = signal(JSONObject().put("sdp", JSONObject().put("type", type).put("s", d.description)))
+
+            /** Sharer side: capture the screen the user approved and send the offer. */
+            fun startShare(ctx: Context, proj: Intent, allowControl: Boolean) {
+              val src = f.createVideoSource(true)
+              val cap = ScreenCapturerAndroid(proj, object : MediaProjection.Callback() {})
+              cap.initialize(SurfaceTextureHelper.create("cap", egl.eglBaseContext), ctx, src.capturerObserver)
+              val dm = ctx.resources.displayMetrics
+              cap.startCapture(dm.widthPixels / 2, dm.heightPixels / 2, 15)
+              pc.addTrack(f.createVideoTrack("screen", src))
+              val ch = pc.createDataChannel("ctl", DataChannel.Init()); channel = ch
+              ch.registerObserver(object : DataChannel.Observer {
+                override fun onBufferedAmountChange(l: Long) {}
+                override fun onStateChange() {}
+                override fun onMessage(b: DataChannel.Buffer) {
+                  if (!allowControl) return                      // control only if the owner granted it
+                  val bytes = ByteArray(b.data.remaining()).also { b.data.get(it) }
+                  val j = JSONObject(String(bytes)); onControl(j.getDouble("x").toFloat(), j.getDouble("y").toFloat())
+                }
+              })
+              pc.createOffer(object : SdpObs() {
+                override fun onCreateSuccess(d: SessionDescription) { pc.setLocalDescription(SdpObs(), d); sdp("offer", d) }
+              }, MediaConstraints())
+            }
+
+            fun handle(d: JSONObject) {
+              d.optJSONObject("sdp")?.let { o ->
+                val offer = o.getString("type") == "offer"
+                val desc = SessionDescription(if (offer) SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER, o.getString("s"))
+                pc.setRemoteDescription(object : SdpObs() {
+                  override fun onSetSuccess() {
+                    if (offer) pc.createAnswer(object : SdpObs() {
+                      override fun onCreateSuccess(a: SessionDescription) { pc.setLocalDescription(SdpObs(), a); sdp("answer", a) }
+                    }, MediaConstraints())
+                  }
+                }, desc)
+              }
+              d.optJSONObject("ice")?.let { pc.addIceCandidate(IceCandidate(it.getString("m"), it.getInt("i"), it.getString("s"))) }
+            }
+
+            fun sendTap(x: Float, y: Float) {
+              val b = JSONObject().put("x", x.toDouble()).put("y", y.toDouble()).toString().toByteArray()
+              channel?.send(DataChannel.Buffer(ByteBuffer.wrap(b), false))
+            }
+            fun close() { pc.close(); egl.release() }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/remoteassist
+          cat > app/src/main/java/com/example/remoteassist/ControlService.kt <<'EOF_FILE'
+          package com.example.remoteassist
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.Intent
+          import android.graphics.Path
+          import android.view.accessibility.AccessibilityEvent
+
+          /** User must enable this in Settings > Accessibility. Used only while a session with control consent is active. */
+          class ControlService : AccessibilityService() {
+            companion object { var inst: ControlService? = null }
+            override fun onServiceConnected() { inst = this }
+            override fun onUnbind(i: Intent?): Boolean { inst = null; return super.onUnbind(i) }
+            override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
+            override fun onInterrupt() {}
+            fun tap(x: Float, y: Float) {
+              val p = Path().apply { moveTo(x, y) }
+              dispatchGesture(GestureDescription.Builder().addStroke(GestureDescription.StrokeDescription(p, 0, 50)).build(), null, null)
+            }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/remoteassist
+          cat > app/src/main/java/com/example/remoteassist/ShareService.kt <<'EOF_FILE'
+          package com.example.remoteassist
+          import android.app.*
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.IBinder
+          import org.json.JSONObject
+
+          /** Foreground service with a persistent notification. "Stop sharing" ends the session instantly. */
+          class ShareService : Service() {
+            private var rtc: Rtc? = null
+            private var peer = ""
+            private val listener: (JSONObject) -> Unit = { m ->
+              when (m.getString("t")) {
+                "signal" -> rtc?.handle(m.getJSONObject("data"))
+                "end" -> stopSelf()
+              }
+            }
+            override fun onBind(i: Intent?): IBinder? = null
+            override fun onStartCommand(i: Intent, flags: Int, id: Int): Int {
+              if (i.getBooleanExtra("stop", false)) { stopSelf(); return START_NOT_STICKY }
+              peer = i.getStringExtra("peer")!!
+              val nm = getSystemService(NotificationManager::class.java)
+              nm.createNotificationChannel(NotificationChannel("share", "Screen sharing", NotificationManager.IMPORTANCE_HIGH))
+              val stop = PendingIntent.getService(this, 0, Intent(this, ShareService::class.java).putExtra("stop", true), PendingIntent.FLAG_IMMUTABLE)
+              val n = Notification.Builder(this, "share").setSmallIcon(android.R.drawable.ic_menu_view)
+                .setContentTitle("Your screen is being shared").setOngoing(true)
+                .addAction(Notification.Action.Builder(null, "Stop sharing", stop).build()).build()
+              startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+              Net.listeners.add(listener)
+              rtc = Rtc(this, peer).also { r ->
+                val dm = resources.displayMetrics
+                r.onControl = { x, y -> ControlService.inst?.tap(x * dm.widthPixels, y * dm.heightPixels) }
+                r.startShare(this, i.getParcelableExtra<Intent>("proj")!!, i.getBooleanExtra("control", false))
+              }
+              return START_NOT_STICKY
+            }
+            override fun onDestroy() {
+              Net.listeners.remove(listener); rtc?.close()
+              Net.send(JSONObject().put("t", "end").put("to", peer))
+            }
+          }
+          EOF_FILE
+          mkdir -p app/src/main/java/com/example/remoteassist
+          cat > app/src/main/java/com/example/remoteassist/MainActivity.kt <<'EOF_FILE'
+          package com.example.remoteassist
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.media.projection.MediaProjectionManager
+          import android.os.Bundle
+          import android.os.Build
+          import android.view.MotionEvent
+          import android.widget.*
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.core.content.ContextCompat
+          import com.journeyapps.barcodescanner.BarcodeEncoder
+          import com.journeyapps.barcodescanner.ScanContract
+          import com.journeyapps.barcodescanner.ScanOptions
+          import com.google.zxing.BarcodeFormat
+          import org.json.JSONObject
+          import org.webrtc.SurfaceViewRenderer
+
+          class MainActivity : androidx.activity.ComponentActivity() {
+            private var people = listOf<JSONObject>()
+            private lateinit var list: ListView
+            private lateinit var qr: ImageView
+            private var from = ""; private var ctl = false
+            private var rtc: Rtc? = null
+
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              Net.connect(this); Net.listeners.add { m -> runOnUiThread { onMsg(m) } }
+              val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40) }
+              root.addView(TextView(this).apply { text = "Remote Assist"; textSize = 26f })
+              root.addView(Button(this).apply { text = "Show my pairing QR"; setOnClickListener {
+                Net.send(JSONObject().put("t", "pair-create").put("name", Build.MODEL)) } })
+              qr = ImageView(this).apply { minimumHeight = 500 }; root.addView(qr)
+              root.addView(Button(this).apply { text = "Scan a QR to pair"; setOnClickListener { scanLauncher.launch(ScanOptions().setBeepEnabled(false)) } })
+              root.addView(TextView(this).apply { text = "Paired contacts (tap to request support)" })
+              list = ListView(this); root.addView(list); setContentView(root)
+              list.setOnItemClickListener { _, _, i, _ ->
+                Net.send(JSONObject().put("t", "request").put("to", people[i].getString("id")))
+                Toast.makeText(this, "Waiting for approval…", Toast.LENGTH_SHORT).show()
+              }
+            }
+
+            private val scanLauncher = registerForActivityResult(ScanContract()) { r ->
+              r.contents?.let { Net.send(JSONObject().put("t", "pair-redeem").put("token", it.substringAfter("c=")).put("name", Build.MODEL)) }
+            }
+            private val projLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { r ->
+              if (r.resultCode == RESULT_OK && r.data != null)
+                ContextCompat.startForegroundService(this, Intent(this, ShareService::class.java)
+                  .putExtra("peer", from).putExtra("control", ctl).putExtra("proj", r.data))
+              else Net.send(JSONObject().put("t", "end").put("to", from))
+            }
+
+            private fun onMsg(m: JSONObject) {
+              when (m.getString("t")) {
+                "contacts" -> { val a = m.getJSONArray("list"); people = (0 until a.length()).map { a.getJSONObject(it) }
+                  list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, people.map { it.getString("name") }) }
+                "token" -> qr.setImageBitmap(BarcodeEncoder().encodeBitmap("remoteassist://pair?c=" + m.getString("token"), BarcodeFormat.QR_CODE, 500, 500))
+                "error" -> Toast.makeText(this, m.getString("msg"), Toast.LENGTH_LONG).show()
+                "request" -> consent(m.getString("from"), m.getString("name"))
+                "consent" -> if (m.getBoolean("allow")) view(m.getString("from"), m.getBoolean("control"))
+                             else Toast.makeText(this, "Request declined", Toast.LENGTH_LONG).show()
+              }
+            }
+
+          /** Owner's side: nothing happens until they explicitly choose. Android then shows its own capture prompt. */
+            private fun consent(id: String, name: String) {
+              AlertDialog.Builder(this).setTitle("$name wants to view your screen")
+                .setMessage("You can stop sharing at any time from the notification.")
+                .setNegativeButton("Deny") { _, _ -> Net.send(JSONObject().put("t", "consent").put("to", id).put("allow", false)) }
+                .setNeutralButton("View only") { _, _ -> approve(id, false) }
+                .setPositiveButton("Allow control") { _, _ -> approve(id, true) }.setCancelable(false).show()
+            }
+            private fun approve(id: String, control: Boolean) {
+              from = id; ctl = control
+              if (control && ControlService.inst == null) {
+                Toast.makeText(this, "Enable Remote Assist in Accessibility settings first", Toast.LENGTH_LONG).show()
+                startActivity(Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)); ctl = false
+              }
+              Net.send(JSONObject().put("t", "consent").put("to", id).put("allow", true).put("control", ctl))
+              projLauncher.launch(getSystemService(Context.MEDIA_PROJECTION_SERVICE).let { (it as MediaProjectionManager).createScreenCaptureIntent() })
+            }
+
+            /** Helper's side: render the shared screen; touches are sent only if control was granted. */
+            private fun view(peer: String, control: Boolean) {
+              val r = Rtc(this, peer).also { rtc = it }
+              val v = SurfaceViewRenderer(this).apply { init(r.egl.eglBaseContext, null) }
+              r.onTrack = { t -> t.addSink(v) }
+              Net.listeners.add { m -> if (m.getString("t") == "signal") r.handle(m.getJSONObject("data"))
+                if (m.getString("t") == "end") runOnUiThread { r.close(); recreate() } }
+              if (control) v.setOnTouchListener { _, e -> if (e.action == MotionEvent.ACTION_UP) r.sendTap(e.x / v.width, e.y / v.height); true }
+              val end = Button(this).apply { text = "End session"; setOnClickListener {
+                Net.send(JSONObject().put("t", "end").put("to", peer)); r.close(); recreate() } }
+              setContentView(LinearLayout(this).apply { orientation = LinearLayout.VERTICAL
+                addView(end); addView(v, LinearLayout.LayoutParams(-1, 0, 1f)) })
+            }
+          }
+          EOF_FILE
+          sed -i "s/YOUR_SERVER_HOST/$HOST/" app/src/main/java/com/example/remoteassist/Net.kt
+      - name: Build
+        working-directory: android
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteAssist-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
