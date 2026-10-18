@@ -1,0 +1,52 @@
+// Signaling server: pairing tokens, consent relay, WebRTC signaling. Never sees screen data.
+ { WebSocketServer } = require("ws");
+const crypto = require("crypto");
+const wss = new WebSocketServer({ port: process.env.PORT || 8080 });
+const devices = {};            // id -> {secret, name, pairs:Set, ws}
+const tokens = {};             // token -> {id, exp}
+const sessions = new Set();    // "a|b" approved sessions
+const key = (a, b) => [a, b].sort().join("|");
+const rid = (n) => crypto.randomBytes(n).toString("hex");
+const send = (ws, o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+const contacts = (d) => [...d.pairs].map((i) => ({ id: i, name: devices[i].name }));
+const push = (id) => { const d = devices[id]; send(d.ws, { t: "contacts", list: contacts(d) }); };
+
+wss.on("connection", (ws) => {
+  let me = null;
+  ws.on("message", (raw) => {
+    let m; try { m = JSON.parse(raw); } catch { return; }
+    if (m.t === "hello") {
+      const d = devices[m.id];
+      if (d && d.secret === m.secret) me = m.id;
+      else { me = rid(8); devices[me] = { secret: rid(16), name: "Device", pairs: new Set() }; }
+      devices[me].ws = ws;
+      send(ws, { t: "welcome", id: me, secret: devices[me].secret });
+      return push(me);
+    }
+    if (!me) return;
+    const self = devices[me];
+    if (m.t === "pair-create") {
+      self.name = String(m.name || "Device").slice(0, 30);
+      const token = rid(6); tokens[token] = { id: me, exp: Date.now() + 300000 };
+      return send(ws, { t: "token", token });
+    }
+    if (m.t === "pair-redeem") {
+      const k = tokens[m.token]; delete tokens[m.token];           // single use
+      if (!k || k.exp < Date.now() || k.id === me) return send(ws, { t: "error", msg: "Invalid or expired code" });
+      self.name = String(m.name || "Device").slice(0, 30);
+      self.pairs.add(k.id); devices[k.id].pairs.add(me);
+      push(me); return push(k.id);
+    }
+    const to = devices[m.to];
+    if (!to || !self.pairs.has(m.to)) return;                       // only paired devices
+    if (m.t === "request") return send(to.ws, { t: "request", from: me, name: self.name });
+    if (m.t === "consent") {
+      if (m.allow) sessions.add(key(me, m.to));
+      return send(to.ws, { t: "consent", from: me, allow: !!m.allow, control: !!m.control });
+    }
+    if (m.t === "signal" && sessions.has(key(me, m.to))) return send(to.ws, { t: "signal", from: me, data: m.data });
+    if (m.t === "end") { sessions.delete(key(me, m.to)); return send(to.ws, { t: "end", from: me }); }
+  });
+  ws.on("close", () => { if (me && devices[me]) devices[me].ws = null; });
+});
+console.log("Signaling server on", process.env.PORT || 8080);
